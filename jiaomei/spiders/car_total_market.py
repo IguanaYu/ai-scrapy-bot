@@ -28,6 +28,8 @@ METRIC_TO_TYPE_PARAM: Dict[str, int] = {
     "export": 4,
 }
 
+SCOPE_LABELS: Sequence[str] = ("狭义乘用车", "广义乘用车")
+
 _MONTH_RE = re.compile(r"(\d+)")
 
 
@@ -185,63 +187,74 @@ class CarTotalMarketSpider(scrapy.Spider):
             self.logger.warning("No chart data extracted from origin=%s", origin)
             return []
         count = 0
-        for item in self._iter_chart_items(blocks, origin):
-            count += 1
-            yield item
+        for block_index, block in enumerate(blocks):
+            for item in self._iter_chart_items(block, origin, block_index):
+                count += 1
+                yield item
         self.logger.info("yielded %s records from origin=%s", count, origin)
+
 
     def _iter_chart_items(
         self,
-        blocks: List[Dict[str, Any]],
+        block: Dict[str, Any],
         origin: str,
+        block_index: int,
     ) -> Iterable[Dict[str, Any]]:
-        for block in blocks:
-            category = str(block.get("category") or "").strip()
-            data_list = block.get("dataList") or []
-            if not isinstance(data_list, list):
+        category = str(block.get("category") or "").strip()
+        if 0 <= block_index < len(SCOPE_LABELS):
+            scope_label = SCOPE_LABELS[block_index]
+        else:
+            scope_label = category or f"block_{block_index}"
+        if not category:
+            category = scope_label
+        data_list = block.get("dataList") or []
+        if not isinstance(data_list, list):
+            return
+        for entry in data_list:
+            if not isinstance(entry, dict):
                 continue
-            for entry in data_list:
-                if not isinstance(entry, dict):
+            month_label = entry.get("month") or ""
+            for year_key, values in entry.items():
+                if not isinstance(values, list):
                     continue
-                month_label = entry.get("month") or ""
-                for year_key, values in entry.items():
-                    if not isinstance(values, list):
+                if not isinstance(year_key, str) or not year_key.endswith("年"):
+                    continue
+                year_digits = "".join(ch for ch in year_key if ch.isdigit())
+                if not year_digits:
+                    continue
+                date_str = _build_date(year_digits, month_label)
+                for idx, (cn_label, metric_key) in enumerate(METRIC_LABELS):
+                    if idx >= len(values):
                         continue
-                    if not isinstance(year_key, str) or not year_key.endswith("年"):
+                    price_value = _as_float(values[idx])
+                    unique = (scope_label, metric_key, year_digits, date_str, price_value)
+                    if unique in self._seen:
                         continue
-                    year_digits = "".join(ch for ch in year_key if ch.isdigit())
-                    if not year_digits:
-                        continue
-                    date_str = _build_date(year_digits, month_label)
-                    for idx, (cn_label, metric_key) in enumerate(METRIC_LABELS):
-                        if idx >= len(values):
-                            continue
-                        price_value = _as_float(values[idx])
-                        unique = (category, metric_key, year_digits, date_str, price_value)
-                        if unique in self._seen:
-                            continue
-                        self._seen.add(unique)
-                        now = datetime.now(timezone.utc)
-                        item = {
-                            "category": category,
-                            "metric": metric_key,
-                            "metric_cn": cn_label,
-                            "year": year_digits,
-                            "month_label": month_label,
-                            "price": price_value,
-                            "date": date_str,
-                            "datasourcelink": self._build_datasourcelink(metric_key),
-                            "created": now,
-                            "updated": now,
-                            "_origin": origin,
-                        }
+                    self._seen.add(unique)
+                    now = datetime.now(timezone.utc)
+                    item = {
+                        "category": category,
+                        "vehicle_scope": scope_label,
+                        "scope_index": block_index,
+                        "metric": metric_key,
+                        "metric_cn": cn_label,
+                        "year": year_digits,
+                        "month_label": month_label,
+                        "price": price_value,
+                        "date": date_str,
+                        "datasourcelink": self._build_datasourcelink(metric_key),
+                        "created": now,
+                        "updated": now,
+                        "_origin": origin,
+                    }
 
-                        table_name = self.metric_table_map.get(metric_key, "")
-                        if table_name:
-                            item["_pg_table"] = table_name
-                        else:
-                            item["_pg_skip_pg"] = True
-                        yield item
+                    table_name = self.metric_table_map.get(metric_key, "")
+                    if table_name and block_index == 0:
+                        item["_pg_table"] = table_name
+                    else:
+                        item["_pg_skip_pg"] = True
+                    yield item
+
 
     def _build_datasourcelink(self, metric_key: str) -> str:
         type_param = METRIC_TO_TYPE_PARAM.get(metric_key)
