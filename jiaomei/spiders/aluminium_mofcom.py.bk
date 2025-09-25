@@ -1,0 +1,153 @@
+﻿import json
+
+import scrapy
+
+ALUMINIUM_PG_FIELD_MAP = {
+    "date": "date",
+    "price": "price",
+    "datasourcelink": "datasourcelink",
+}
+class AluminiumMofcomSpider(scrapy.Spider):
+    name = "aluminium_mofcom"
+    allowed_domains = ["price.mofcom.gov.cn"]
+
+    api_url = "https://price.mofcom.gov.cn/datamofcom/front/price/pricequotation/priceQueryList"
+    detail_url = "https://price.mofcom.gov.cn/price_2021/pricequotation/pricequotationdetail.shtml"
+
+    custom_settings = {
+        "ITEM_PIPELINES": {},
+        "PG_TABLE": None,
+        "DOWNLOADER_MIDDLEWARES": {
+            "jiaomei.middlewares.SeleniumCdpMiddleware": None,
+        },
+        "FEEDS": {
+            "outputs/aluminium_mofcom.json": {
+                "format": "json",
+                "encoding": "utf-8",
+                "indent": 2,
+                "overwrite": True,
+            }
+        },
+    }
+
+    pg_pipeline = {
+        "pg_table": "zonal_crawler_aluminium_price",
+        "pg_field_map": ALUMINIUM_PG_FIELD_MAP,
+        "pg_static_fields": {"source": "aluminium_mofcom"},
+    }
+
+    def __init__(self, seqno="289", start_time="", end_time="", page_size=50, max_pages=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seqno = str(seqno).strip() or "289"
+        self.start_time = str(start_time or "").strip()
+        self.end_time = str(end_time or "").strip()
+        try:
+            self.page_size = int(page_size)
+        except (TypeError, ValueError):
+            self.page_size = 50
+        try:
+            self.max_pages = int(max_pages) if max_pages is not None else None
+        except (TypeError, ValueError):
+            self.max_pages = None
+
+    async def start(self):
+        detail = f"{self.detail_url}?seqno={self.seqno}"
+        yield scrapy.Request(
+            detail,
+            callback=self.after_landing,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            },
+            dont_filter=True,
+        )
+
+    def after_landing(self, response):
+        yield self._fetch_page(1)
+
+    def _fetch_page(self, page_number: int):
+        form = {
+            "seqno": self.seqno,
+            "startTime": self.start_time,
+            "endTime": self.end_time,
+            "pageNumber": str(page_number),
+            "pageSize": str(self.page_size),
+        }
+        return scrapy.FormRequest(
+            self.api_url,
+            method="POST",
+            formdata=form,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://price.mofcom.gov.cn",
+                "Referer": f"{self.detail_url}?seqno={self.seqno}",
+            },
+            callback=self.parse_api,
+            meta={"page": page_number},
+            dont_filter=True,
+        )
+
+    def parse_api(self, response):
+        page_number = int(response.meta.get("page", 1))
+        try:
+            data = json.loads(response.text)
+        except json.JSONDecodeError:
+            self.logger.error("Failed to decode JSON on page %s", page_number)
+            return
+
+        rows = data.get("rows") or []
+        detail_link = f"{self.detail_url}?seqno={self.seqno}"
+
+        for row in rows:
+            yyyy = str(row.get("yyyy") or "").strip()
+            mm = str(row.get("mm") or "").strip().zfill(2)
+            dd = str(row.get("dd") or "").strip().zfill(2)
+            date_parts = [yyyy, mm, dd]
+            date_str = "-".join(part for part in date_parts if part)
+            date_str = date_str if date_str.count("-") == 2 else ""
+
+            raw_price = str(row.get("price") or "").replace(",", "").strip()
+            price_value = raw_price
+            if raw_price:
+                try:
+                    price_value = float(raw_price)
+                except ValueError:
+                    price_value = raw_price
+
+            yield {
+                "price": price_value,
+                "date": date_str,
+                "datasourcelink": detail_link,
+            }
+
+        if self.max_pages is not None and page_number >= self.max_pages:
+            return
+
+        if not rows:
+            return
+
+        next_page = data.get("nextPage")
+        max_pages = data.get("maxPageNum") or data.get("pages") or data.get("totalPages")
+
+        try:
+            next_page = int(next_page) if next_page is not None else None
+        except (TypeError, ValueError):
+            next_page = None
+
+        try:
+            max_pages = int(max_pages) if max_pages else page_number
+        except (TypeError, ValueError):
+            max_pages = page_number
+
+        if next_page and next_page > page_number:
+            if self.max_pages is None or next_page <= self.max_pages:
+                yield self._fetch_page(next_page)
+            return
+
+        if page_number < max_pages:
+            candidate = page_number + 1
+            if self.max_pages is None or candidate <= self.max_pages:
+                yield self._fetch_page(candidate)
